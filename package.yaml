@@ -1,0 +1,39 @@
+name: algolia
+version: '0.1.0.0'
+category: Web
+author: Ian Duncan
+maintainer: ian@iankduncan.com
+copyright: Ian Duncan
+license: BSD3
+github: iand675/algolia
+extra-source-files:
+- README.md
+library:
+  source-dirs: src
+  exposed-modules:
+  - Network.Algolia.Search
+  dependencies:
+  - base >=4.7 && <5
+  - bytestring
+  - aeson
+  - http-client
+  - http-client-tls
+  - http-types
+  - time
+  - text
+  - scientific
+  - unordered-containers
+  - attoparsec
+  - mtl
+  - exceptions
+tests:
+  algolia-test:
+    main: Spec.hs
+    source-dirs: test
+    ghc-options:
+    - -threaded
+    - -rtsopts
+    - -with-rtsopts=-N
+    dependencies:
+    - base
+    - algolia
