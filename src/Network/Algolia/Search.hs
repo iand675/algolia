@@ -3,21 +3,26 @@
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE QuasiQuotes #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
 module Network.Algolia.Search where
 import Control.Monad.Catch
 import Control.Monad.Reader
 import qualified Data.Attoparsec.ByteString as A
 import Data.Aeson.Parser
 import Data.Aeson.Types (typeMismatch)
-import Data.ByteString.Char8 (ByteString)
+import Data.ByteString.Char8 (ByteString, unpack)
 import Data.ByteString.Lazy (toStrict)
 import Data.ByteString.Builder (toLazyByteString, intDec)
+import Data.Has
 import Data.HashMap.Strict (HashMap)
 import qualified Data.HashMap.Strict as H
 import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Text.Encoding (encodeUtf8, decodeUtf8)
 import Data.Time
+import Data.Typeable
+import Data.Vector (Vector)
 import Data.Aeson hiding (Result)
 import Data.Scientific
 import Data.Monoid
@@ -25,30 +30,39 @@ import Data.String
 import Network.HTTP.Client
 import Network.HTTP.Client.TLS
 import Network.HTTP.Types
+import Network.URI.Template
+import qualified Network.URI.Template as URI
 
 data AlgoliaClient = AlgoliaClient
-  { algoliaClientManager :: Manager
-  -- , algoliaClientFallbackUrls :: [Text]
+  { algoliaClientFallbackUrls :: Vector Text
   , algoliaClientApiKey :: ByteString
   , algoliaClientApplicationId :: ByteString
   }
 
-mkAlgoliaClient :: ByteString -> ByteString -> IO AlgoliaClient
-mkAlgoliaClient k aid = do
-  m <- getGlobalManager
-  return $ AlgoliaClient m k aid
+mkAlgoliaClient :: ByteString -> ByteString -> AlgoliaClient
+mkAlgoliaClient k aid = AlgoliaClient mempty k aid
 
-aesonReader :: FromJSON a => IO ByteString -> IO a
+simpleAlgolia :: (MonadIO m, Has AlgoliaClient c) => c -> ReaderT c m a -> m a
+simpleAlgolia = flip runReaderT
+
+data AlgoliaError
+  = JsonParseError String
+  | NonConformingResult Value String
+  deriving (Show, Typeable)
+
+instance Exception AlgoliaError
+
+aesonReader :: (MonadIO m, MonadThrow m, FromJSON a) => IO ByteString -> m a
 aesonReader m = do
-  s <- m
+  s <- liftIO m
   r <- go (A.parse value' s)
   case fromJSON r of
-    Error e -> error e
+    Error e -> throwM $ NonConformingResult r e
     Success x -> return x
   where
-    go (A.Fail _ _ err) = error err
+    go (A.Fail _ _ err) = throwM $ JsonParseError err
     go (A.Partial f) = do
-      s <- m
+      s <- liftIO m
       go (f s)
     go (A.Done _ r) = return r
 
@@ -65,45 +79,60 @@ mkBaseRequest AlgoliaClient{..} = defaultRequest
 
 mkReadRequest :: AlgoliaClient -> Request
 mkReadRequest c@AlgoliaClient{..} = (mkBaseRequest c)
-  { host = algoliaClientApplicationId <> "-dsn.algolia.net"
+  { host = [uri|{strHost}-dsn.algolia.net|]
   }
+  where
+    strHost = URI.String $ unpack algoliaClientApplicationId
 
 mkWriteRequest :: ToJSON a => AlgoliaClient -> a -> Request
 mkWriteRequest c@AlgoliaClient{..} x = (mkBaseRequest c)
-  { host = algoliaClientApplicationId <> ".algolia.net"
+  { host = [uri|{strHost}.algolia.net|]
   , requestBody = RequestBodyLBS $ encode x
   }
+  where
+    strHost = URI.String $ unpack algoliaClientApplicationId
 
 
 mkWriteRequest' :: AlgoliaClient -> Request
 mkWriteRequest' c@AlgoliaClient{..} = (mkBaseRequest c)
-  { host = algoliaClientApplicationId <> ".algolia.net"
+  { host = [uri|{strHost}.algolia.net}|]
   }
+  where
+    strHost = URI.String $ unpack algoliaClientApplicationId
 
 withApiKey :: MonadReader AlgoliaClient m => ByteString -> m a -> m a
 withApiKey k = local (\a -> a { algoliaClientApiKey = k })
 
-type Result a = forall m. (MonadReader AlgoliaClient m, MonadThrow m, MonadIO m) => m a
+type Result a = forall c m. (Has AlgoliaClient c, MonadReader c m, MonadThrow m, MonadIO m) => m a
 
 newtype IndexName a = IndexName { fromIndexName :: ByteString }
 
 instance ToJSON (IndexName a) where
   toJSON = toJSON . decodeUtf8 . fromIndexName
+
 instance FromJSON (IndexName a) where
-  parseJSON (String t) = return $ IndexName $ encodeUtf8 t
-  parseJSON invalid = typeMismatch "IndexName" invalid
+  parseJSON = withText "IndexName" (return . IndexName . encodeUtf8)
+
+instance ToTemplateValue (IndexName a) where
+  toTemplateValue = Single . unpack . fromIndexName
 
 newtype ObjectId a = ObjectId { fromObjectId :: ByteString }
   deriving (Show, Eq, IsString)
 
 instance ToJSON (ObjectId a) where
   toJSON = toJSON . decodeUtf8 . fromObjectId
+
 instance FromJSON (ObjectId a) where
-  parseJSON (String t) = return $ ObjectId $ encodeUtf8 t
-  parseJSON invalid = typeMismatch "ObjectId" invalid
+  parseJSON = withText "ObjectId" (return . ObjectId . encodeUtf8)
+
+instance ToTemplateValue (ObjectId a) where
+  toTemplateValue = Single . unpack . fromObjectId
 
 newtype TaskId = TaskId { fromTaskId :: Int }
   deriving (ToJSON, FromJSON)
+
+instance ToTemplateValue TaskId where
+  toTemplateValue = toTemplateValue . fromTaskId
 
 data IndexInfo = IndexInfo
   { indexInfoName :: Text
@@ -139,14 +168,19 @@ instance FromJSON ListIndicesResponse where
     <$> r .: "items"
     <*> r .: "nbPages"
 
-listIndices :: Maybe Int -> Result ListIndicesResponse
+
+-- | List existing indexes.
+listIndices
+  :: Maybe Int -- ^ Requested page (zero-based). When specified, will retrieve a specific page; the page size is implicitly set to 100. When @Nothing@, will retrieve all indices (no pagination).
+  -> Result ListIndicesResponse
 listIndices _ {- TODO -} = do
-  c <- ask
+  c <- getter <$> ask
+  m <- liftIO getGlobalManager
   let r = (mkReadRequest c)
-          { path = "/1/indexes"
+          { path = [uri|/1/indexes|]
           , method = methodGet
           }
-  liftIO $ withResponse r (algoliaClientManager c) $ \resp -> do
+  liftIO $ withResponse r m $ \resp -> do
     aesonReader $ responseBody resp
 
 data SearchParameters = SearchParameters
@@ -155,8 +189,10 @@ data SearchParameters = SearchParameters
   -- , restrictSearchableAttributes :: [Text]
 {-
   , filters :: Maybe Filters
+-}
   , facets :: [Text]
   , maxValuesPerFacet :: Maybe Int
+{-
   , facetFilters :: [(Text, Text)] -- todo
   , facetingAfterDistinct :: Bool
 -}
@@ -166,15 +202,13 @@ data SearchParameters = SearchParameters
   , highlightPostTag :: Text
   , snippetEllipsisText :: Maybe Text
   , restrictHighlightAndSnippetArrays :: Bool
-{-
   , page :: Int
   , hitsPerPage :: Int
-  , offset :: Int
-  , length :: Int
-  -}
+  , offset :: Maybe Int
+  , length :: Maybe Int
   , minWordSizeFor1Typo :: Int
   , minWordSizeFor2Typos :: Int
-  {-
+{-
   , typoTolerance :: TypoTolerance
   , allowTyposOnNumericTokens :: Bool
   , ignorePlurals :: Either Bool [CountryCode]
@@ -198,9 +232,9 @@ data SearchParameters = SearchParameters
   , getRankingInfo :: Bool
   , numericFilters :: [NumericFilter]
   , tagFilters :: [TagFilter]
+  -}
   , analytics :: Bool
   , analyticsTags :: [Text]
-  -}
   , synonyms :: Bool
   , replaceSynonymsInHighlight :: Bool
   , minProximity :: Int
@@ -215,7 +249,13 @@ defaultQuery :: SearchParameters
 defaultQuery = SearchParameters
   { query = ""
   , attributesToRetrieve = ["*"]
+  , facets = []
+  , maxValuesPerFacet = Nothing
   -- , restrictSearchableAttributes = [] -- Make null
+  , page = 0
+  , hitsPerPage = 20
+  , offset = Nothing
+  , length = Nothing
   , attributesToHighlight = []
   , attributesToSnippet = []
   , highlightPreTag = "<em>"
@@ -224,6 +264,8 @@ defaultQuery = SearchParameters
   , restrictHighlightAndSnippetArrays = False
   , minWordSizeFor1Typo = 4
   , minWordSizeFor2Typos = 8
+  , analytics = True
+  , analyticsTags = []
   , synonyms = True
   , replaceSynonymsInHighlight = True
   , minProximity = 1
@@ -273,16 +315,21 @@ instance FromJSON a => FromJSON (SearchResults a) where
   parseJSON = withObject "SearchResults" $ \r -> SearchResults
     <$> r .: "hits"
 
-
+-- | Return objects that match the query.
+--
+-- You can find the list of parameters that you can use in the POST body in the Search Parameters section.
+--
+-- Alternatively, parameters may be specified as a URL-encoded query string inside the params attribute.
 searchIndex :: FromJSON a => IndexName a -> SearchParameters -> Result Object -- (SearchResults a)
 searchIndex ix params = do
-  c <- ask
+  c <- getter <$> ask
+  m <- liftIO getGlobalManager
   let r = (mkReadRequest c)
-          { path = "/1/indexes/" <> fromIndexName ix <> "/query"
+          { path = [uri|/1/indexes/{ix}/query|]
           , method = methodPost
           , requestBody = RequestBodyLBS $ encode params
           }
-  liftIO $ withResponse r (algoliaClientManager c) $ \resp -> do
+  liftIO $ withResponse r m $ \resp -> do
     aesonReader $ responseBody resp
 
 {-
@@ -299,25 +346,28 @@ instance FromJSON DeleteIndexResponse where
     <$> o .: "deletedAt"
     <*> o .: "taskId"
 
+-- | Delete an existing index.
 deleteIndex :: IndexName a -> Result DeleteIndexResponse
 deleteIndex ix = do
-  c <- ask
+  c <- getter <$> ask
+  m <- liftIO getGlobalManager
   let r = (mkWriteRequest' c)
-          { path = "/1/indexes/" <> fromIndexName ix
+          { path = [uri|/1/indexes/{ix}|]
           , method = methodDelete
           }
-  liftIO $ withResponse r (algoliaClientManager c) $ \resp -> do
+  liftIO $ withResponse r m $ \resp -> do
     aesonReader $ responseBody resp
 
-
+-- | Delete an index’s content, but leave settings and index-specific API keys untouched.
 clearIndex :: IndexName a -> Result IndexOperationResponse
 clearIndex ix = do
-  c <- ask
+  c <- getter <$> ask
+  m <- liftIO getGlobalManager
   let r = (mkReadRequest c)
-          { path = "/1/indexes/" <> fromIndexName ix <> "/clear"
+          { path = [uri|/1/indexes/{ix}/clear|]
           , method = methodPost
           }
-  liftIO $ withResponse r (algoliaClientManager c) $ \resp -> do
+  liftIO $ withResponse r m $ \resp -> do
     aesonReader $ responseBody resp
 
 data AddObjectWithoutIdResponse a = AddObjectWithoutIdResponse
@@ -334,14 +384,16 @@ instance FromJSON (AddObjectWithoutIdResponse a) where
 
 
 -- Note: ToJSON instance must produce a JSON object
+-- | Add an object to the index, automatically assigning it an object ID.
 addObjectWithoutId :: ToJSON a => IndexName a -> a -> Result (AddObjectWithoutIdResponse a)
 addObjectWithoutId ix val = do
-  c <- ask
+  c <- getter <$> ask
+  m <- liftIO getGlobalManager
   let r = (mkWriteRequest c val)
-          { path = "/1/indexes/" <> fromIndexName ix
+          { path = [uri|/1/indexes/{ix}|]
           , method = methodPost
           }
-  liftIO $ withResponse r (algoliaClientManager c) $ \resp -> do
+  liftIO $ withResponse r m $ \resp -> do
     aesonReader $ responseBody resp
 
 data AddObjectByIdResponse a = AddObjectByIdResponse
@@ -357,14 +409,21 @@ instance FromJSON (AddObjectByIdResponse a) where
     <*> a .: "objectID"
 
 -- Note: ToJSON instance must produce a JSON object
+-- | Add or replace an object with a given object ID. If the object does not exist, it will be created. If it already exists, it will be replaced.
+--
+-- Be careful: when an object already exists for the specified object ID, the whole object is replaced: existing attributes that are not replaced are deleted.
+--
+-- If you want to update only part of an object, use a partial update instead.
+
 addObjectById :: ToJSON a => IndexName a -> ObjectId a -> a -> Result (AddObjectByIdResponse a)
 addObjectById ix i val = do
-  c <- ask
+  c <- getter <$> ask
+  m <- liftIO getGlobalManager
   let r = (mkWriteRequest c val)
-          { path = "/1/indexes/" <> fromIndexName ix <> "/" <> fromObjectId i
+          { path = [uri|/1/indexes/{ix}/{i}|]
           , method = methodPut
           }
-  liftIO $ withResponse r (algoliaClientManager c) $ \resp -> do
+  liftIO $ withResponse r m $ \resp -> do
     aesonReader $ responseBody resp
 
 {-
@@ -393,12 +452,13 @@ instance FromJSON DeleteObjectResponse where
 
 deleteObject :: IndexName a -> ObjectId a -> Result DeleteObjectResponse
 deleteObject ix i = do
-  c <- ask
+  c <- getter <$> ask
+  m <- liftIO getGlobalManager
   let r = (mkWriteRequest' c)
-          { path = "/1/indexes/" <> fromIndexName ix <> "/" <> fromObjectId i
+          { path = [uri|/1/indexes/{ix}/{i}|]
           , method = methodDelete
           }
-  liftIO $ withResponse r (algoliaClientManager c) $ \resp -> do
+  liftIO $ withResponse r m $ \resp -> do
     aesonReader $ responseBody resp
 
 {-
@@ -425,17 +485,18 @@ copyOrMoveIndex
   -> IndexName a
   -> Result IndexOperationResponse
 copyOrMoveIndex op from to = do
-  c <- ask
+  c <- getter <$> ask
+  m <- liftIO getGlobalManager
   let r = (mkWriteRequest c $ object
             [ "operation" .= case op of
                                MoveIndex -> "move" :: Text
                                CopyIndex -> "copy"
             , "destination" .= to
             ])
-          { path = "/1/indexes/" <> fromIndexName from <> "/operation"
+          { path = [uri|/1/indexes/{from}/operation|] -- "/1/indexes/" <> fromIndexName from <> "/operation"
           , method = methodPost
           }
-  liftIO $ withResponse r (algoliaClientManager c) $ \resp -> do
+  liftIO $ withResponse r m $ \resp -> do
     aesonReader $ responseBody resp
 
 data TaskStatus = Published | NotPublished
@@ -459,12 +520,13 @@ instance FromJSON TaskStatusResult where
 
 getTaskStatus :: IndexName a -> TaskId -> Result TaskStatusResult
 getTaskStatus ix t = do
-  c <- ask
+  c <- getter <$> ask
+  m <- liftIO getGlobalManager
   let r = (mkReadRequest c)
-          { path = "/1/indexes/" <> fromIndexName ix <> "/task/" <> (toStrict $ toLazyByteString $ intDec $ fromTaskId t)
+          { path = [uri|/v1/indexes/{ix}/task/{t}|]-- "/1/indexes/" <> fromIndexName ix <> "/task/" <> (toStrict $ toLazyByteString $ intDec $ fromTaskId t)
           , method = methodPost
           }
-  liftIO $ withResponse r (algoliaClientManager c) $ \resp -> do
+  liftIO $ withResponse r m $ \resp -> do
     aesonReader $ responseBody resp
 {-
 addIndexApiKey
@@ -507,11 +569,11 @@ deleteSynonymSet
 -}
 
 data SynonymType
-  = Synonym
-  | OneWaySynonym
-  | AltCorrection1
+  = Synonym -- ^ Multi-way synonyms (a.k.a. “regular synonyms”). A set of words or phrases that are all substitutable to one another. Any query containing one of them can match records containing any of them.
+  | OneWaySynonym -- ^ One-way synonym. Alternative matches for a given input. If the input appears inside a query, it will match records containing any of the defined synonyms. The opposite is not true: if a synonym appears in a query, it will not match records containing the input, nor the other synonyms.
+  | AltCorrection1 -- ^ Alternative corrections. Same as a one-way synonym, except that when matched, they will count as 1 (respectively 2) typos in the ranking formula.
   | AltCorrection2
-  | Placeholder
+  | Placeholder -- ^ A placeholder is a special text token that is placed inside records and can match many inputs. For more information on synonyms, please read our Synonyms guide. https://www.algolia.com/doc/guides/textual-relevance/synonyms/
 
 synonymTypeName :: SynonymType -> Text
 synonymTypeName Synonym = "synonym"
@@ -521,10 +583,10 @@ synonymTypeName AltCorrection2 = "altcorrection2"
 synonymTypeName Placeholder = "placeholder"
 
 data SynonymSearch = SynonymSearch
-  { synonymSearchQuery :: Maybe Text
-  , synonymSearchType :: [SynonymType]
-  , synonymSearchPage :: Maybe Int
-  , synonymSearchHitsPerPage :: Maybe Int
+  { synonymSearchQuery :: Maybe Text -- ^ Search for specific synonyms matching this string.
+  , synonymSearchType :: [SynonymType] -- ^ Only search for specific types of synonyms.
+  , synonymSearchPage :: Maybe Int -- ^ Number of the page to retrieve (zero-based).
+  , synonymSearchHitsPerPage :: Maybe Int -- ^ Maximum number of synonym objects to retrieve.
   }
 
 instance ToJSON SynonymSearch where
@@ -532,22 +594,24 @@ instance ToJSON SynonymSearch where
     [ "query" .= synonymSearchQuery
     , "type" .= case synonymSearchType of
         [] -> Null
-        ts -> String $ T.intercalate "," $ map synonymTypeName ts
+        ts -> Data.Aeson.String $ T.intercalate "," $ map synonymTypeName ts
     , "page" .= synonymSearchPage
     , "hitsPerPage" .= synonymSearchHitsPerPage
     ]
 
 type SynonymSearchResponse = Object
 
+-- | Search or browse all synonyms, optionally filtering them by type.
 searchSynonyms :: IndexName a -> SynonymSearch -> Result SynonymSearchResponse
 searchSynonyms ix params = do
-  c <- ask
+  c <- getter <$> ask
+  m <- liftIO getGlobalManager
   let r = (mkReadRequest c)
           { path = "/1/indexes/" <> fromIndexName ix <> "/synonyms/search"
           , method = methodPost
           , requestBody = RequestBodyLBS $ encode params
           }
-  liftIO $ withResponse r (algoliaClientManager c) $ \resp -> do
+  liftIO $ withResponse r m $ \resp -> do
     aesonReader $ responseBody resp
 
 {-

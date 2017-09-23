@@ -26,6 +26,9 @@ library:
   - attoparsec
   - mtl
   - exceptions
+  - uri-templater
+  - data-has
+  - vector
 tests:
   algolia-test:
     main: Spec.hs
