@@ -29,6 +29,7 @@ library:
   - uri-templater
   - data-has
   - vector
+  - hashable
 tests:
   algolia-test:
     main: Spec.hs

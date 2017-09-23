@@ -49,6 +49,7 @@ library
     , uri-templater
     , data-has
     , vector
+    , hashable
   default-language: Haskell2010
 
 test-suite algolia-test

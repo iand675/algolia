@@ -10,11 +10,9 @@ import Control.Monad.Catch
 import Control.Monad.Reader
 import qualified Data.Attoparsec.ByteString as A
 import Data.Aeson.Parser
-import Data.Aeson.Types (typeMismatch)
 import Data.ByteString.Char8 (ByteString, unpack)
-import Data.ByteString.Lazy (toStrict)
-import Data.ByteString.Builder (toLazyByteString, intDec)
 import Data.Has
+import Data.Hashable
 import Data.HashMap.Strict (HashMap)
 import qualified Data.HashMap.Strict as H
 import Data.Text (Text)
@@ -106,6 +104,7 @@ withApiKey k = local (\a -> a { algoliaClientApiKey = k })
 type Result a = forall c m. (Has AlgoliaClient c, MonadReader c m, MonadThrow m, MonadIO m) => m a
 
 newtype IndexName a = IndexName { fromIndexName :: ByteString }
+  deriving (Show, Eq)
 
 instance ToJSON (IndexName a) where
   toJSON = toJSON . decodeUtf8 . fromIndexName
@@ -129,7 +128,7 @@ instance ToTemplateValue (ObjectId a) where
   toTemplateValue = Single . unpack . fromObjectId
 
 newtype TaskId = TaskId { fromTaskId :: Int }
-  deriving (ToJSON, FromJSON)
+  deriving (Show, Eq, ToJSON, FromJSON)
 
 instance ToTemplateValue TaskId where
   toTemplateValue = toTemplateValue . fromTaskId
@@ -243,7 +242,7 @@ data SearchParameters = SearchParameters
   -}
   , maxFacetHits :: Int
   , percentileComputation :: Bool
-  }
+  } deriving (Show)
 
 defaultQuery :: SearchParameters
 defaultQuery = SearchParameters
@@ -286,41 +285,77 @@ data SearchResult a = SearchResult
   } deriving (Show)
 
 instance (FromJSON a) => FromJSON (SearchResult a) where
-  parseJSON = withObject "SearchResult" $ \o -> do
-    h <- o .:? "_highlightResult"
-    s <- o .:? "_snippetResult"
-    r <- o .:? "_rankingInfo"
-    v <- parseJSON $
-         Object $
-         H.delete "_highlightResult" $
-         H.delete "_snippetResult" $
-         H.delete "_rankingInfo" o
-    return $ SearchResult v h s r
+  parseJSON =
+    withObject "SearchResult" $ \o -> do
+      h <- o .:? "_highlightResult"
+      s <- o .:? "_snippetResult"
+      r <- o .:? "_rankingInfo"
+      v <-
+        parseJSON $
+        Object $
+        H.delete "_highlightResult" $
+        H.delete "_snippetResult" $ H.delete "_rankingInfo" o
+      return $ SearchResult v h s r
+
+data FacetStat = FacetStat
+  { facetStatMin :: Scientific
+  , facetStatMax :: Scientific
+  , facetStatAvg :: Scientific
+  , facetStatSum :: Scientific
+  } deriving (Show)
+
+instance FromJSON FacetStat where
+  parseJSON =
+    withObject "FacetStat" $ \o ->
+      FacetStat <$> o .: "min" <*> o .: "max" <*> o .: "avg" <*> o .: "sum"
 
 data SearchResults a = SearchResults
   { searchResultsHits :: [SearchResult a]
-{-
   , searchResultsPage :: Int
   , searchResultsNbHits :: Int
   , searchResultsNbPages :: Int
   , searchResultsHitsPerPage :: Int
   , searchResultsProcessingtimeMs :: Int
   , searchResultsQuery :: Text
-  , searchResultsParsedQuery :: Text
+  , searchResultsParsedQuery :: Maybe Text
   , searchResultsParams :: Text
--}
+  , searchResultsExhaustiveNbHits :: Bool
+  , searchResultsQueryAfterRemoval :: Maybe Text
+  , searchResultsMessage :: Maybe Text
+  , searchResultsAroundLatLng :: Maybe Text -- TODO better type
+  , searchResultsAutomaticRadius :: Maybe Text -- TODO better type
+  , searchResultsServerUsed :: Maybe Text
+  , searchResultsFacets :: Maybe (HashMap FacetName Int)
+  , searchResultsFacetsStats :: Maybe (HashMap FacetName FacetStat)
+  , searchResultsExhaustiveFacetCount :: Maybe Bool
   } deriving (Show)
 
 instance FromJSON a => FromJSON (SearchResults a) where
   parseJSON = withObject "SearchResults" $ \r -> SearchResults
     <$> r .: "hits"
-
+    <*> r .: "page"
+    <*> r .: "nbHits"
+    <*> r .: "nbPages"
+    <*> r .: "hitsPerPage"
+    <*> r .: "processingTimeMS"
+    <*> r .: "query"
+    <*> r .:? "parsedQuery"
+    <*> r .: "params"
+    <*> r .: "exhaustiveNbHits"
+    <*> r .:? "queryAfterRemoval"
+    <*> r .:? "message"
+    <*> r .:? "aroundLatLng"
+    <*> r .:? "automaticRadius"
+    <*> r .:? "serverUsed"
+    <*> r .:? "facets"
+    <*> r .:? "facets_stats"
+    <*> r .:? "exhaustiveFacetsCount"
 -- | Return objects that match the query.
 --
 -- You can find the list of parameters that you can use in the POST body in the Search Parameters section.
 --
 -- Alternatively, parameters may be specified as a URL-encoded query string inside the params attribute.
-searchIndex :: FromJSON a => IndexName a -> SearchParameters -> Result Object -- (SearchResults a)
+searchIndex :: FromJSON a => IndexName a -> SearchParameters -> Result {- Object -} (SearchResults a)
 searchIndex ix params = do
   c <- getter <$> ask
   m <- liftIO getGlobalManager
@@ -339,7 +374,7 @@ searchMultipleIndices
 data DeleteIndexResponse = DeleteIndexResponse
   { deleteIndexResponseDeletedAt :: UTCTime
   , deleteIndexResponseTaskId :: TaskId
-  }
+  } deriving (Show)
 
 instance FromJSON DeleteIndexResponse where
   parseJSON = withObject "DeleteIndexResponse" $ \o -> DeleteIndexResponse
@@ -374,7 +409,7 @@ data AddObjectWithoutIdResponse a = AddObjectWithoutIdResponse
   { addObjectWithoutIdResponseCreatedAt :: UTCTime
   , addObjectWithoutIdResponseTaskId :: TaskId
   , addObjectWithoutIdResponseObjectId :: ObjectId a
-  }
+  } deriving (Show, Eq)
 
 instance FromJSON (AddObjectWithoutIdResponse a) where
   parseJSON = withObject "AddObjectWithoutIdResponse" $ \a -> AddObjectWithoutIdResponse
@@ -426,7 +461,6 @@ addObjectById ix i val = do
   liftIO $ withResponse r m $ \resp -> do
     aesonReader $ responseBody resp
 
-{-
 data UpdateOp
   = Set Value
   | Increment Scientific
@@ -435,10 +469,13 @@ data UpdateOp
   | Remove (Either Scientific Text)
   | AddUnique (Either Scientific Text)
 
+data ObjectResponse = ObjectResponse
+
 partiallyUpdateObject :: IndexName a -> HashMap Text UpdateOp -> Result ObjectResponse
+partiallyUpdateObject = undefined
+{-
 retrieveObject :: FromJSON a => IndexName a -> ObjectId a -> [Text] -> Result (Maybe a)
 retrieveObjects :: FromJSON a => [(IndexName Object, ObjectId Object, Maybe [Text])] -> Result [Object]
-
 -}
 data DeleteObjectResponse = DeleteObjectResponse
   { deleteObjectResponseDeletedAt :: UTCTime
@@ -469,10 +506,12 @@ changeIndexSettings
 -}
 
 data IndexOperation = MoveIndex | CopyIndex
+  deriving (Show, Eq)
+
 data IndexOperationResponse = IndexOperationResponse
   { indexOperationResponseUpdatedAt :: UTCTime
   , indexOperationResponseTaskId :: TaskId
-  }
+  } deriving (Show, Eq)
 
 instance FromJSON IndexOperationResponse where
   parseJSON = withObject "IndexOperationResponse" $ \a -> IndexOperationResponse
@@ -487,17 +526,19 @@ copyOrMoveIndex
 copyOrMoveIndex op from to = do
   c <- getter <$> ask
   m <- liftIO getGlobalManager
-  let r = (mkWriteRequest c $ object
-            [ "operation" .= case op of
-                               MoveIndex -> "move" :: Text
-                               CopyIndex -> "copy"
-            , "destination" .= to
-            ])
-          { path = [uri|/1/indexes/{from}/operation|] -- "/1/indexes/" <> fromIndexName from <> "/operation"
-          , method = methodPost
-          }
-  liftIO $ withResponse r m $ \resp -> do
-    aesonReader $ responseBody resp
+  let r =
+        (mkWriteRequest c $
+         object
+           [ "operation" .=
+             case op of
+               MoveIndex -> "move" :: Text
+               CopyIndex -> "copy"
+           , "destination" .= to
+           ])
+        { path = [uri|/1/indexes/{from}/operation|] -- "/1/indexes/" <> fromIndexName from <> "/operation"
+        , method = methodPost
+        }
+  liftIO $ withResponse r m $ \resp -> do aesonReader $ responseBody resp
 
 data TaskStatus = Published | NotPublished
   deriving (Show)
@@ -523,7 +564,7 @@ getTaskStatus ix t = do
   c <- getter <$> ask
   m <- liftIO getGlobalManager
   let r = (mkReadRequest c)
-          { path = [uri|/v1/indexes/{ix}/task/{t}|]-- "/1/indexes/" <> fromIndexName ix <> "/task/" <> (toStrict $ toLazyByteString $ intDec $ fromTaskId t)
+          { path = [uri|/v1/indexes/{ix}/task/{t}|]
           , method = methodPost
           }
   liftIO $ withResponse r m $ \resp -> do
@@ -535,7 +576,51 @@ listIndexApiKeys
 listIndexApiKeysForAllIndices
 retriveIndexApiKey
 deleteIndexApiKey
-searchFacetValues
+-}
+
+newtype FacetName = FacetName { fromFacetName :: Text }
+  deriving (Show, Eq, FromJSON, FromJSONKey, Hashable)
+
+instance ToTemplateValue FacetName where
+  toTemplateValue = toTemplateValue . fromFacetName
+
+newtype FacetQuery = FacetQuery { fromFacetQuery :: Text }
+  deriving (Show, Eq)
+
+data FacetHit = FacetHit
+  { facetHitValue :: Text
+  , facetHitHighlighted :: Text
+  , facetHitCount :: Int
+  } deriving (Show, Eq)
+
+instance FromJSON FacetHit where
+  parseJSON = withObject "FacetHit" $ \o -> FacetHit
+    <$> o .: "value"
+    <*> o .: "highlighted"
+    <*> o .: "count"
+
+newtype FacetHits = FacetHits
+  { facetHits :: [FacetHit]
+  } deriving (Show, Eq)
+
+instance FromJSON FacetHits where
+  parseJSON = withObject "FacetHits" $ \o -> FacetHits
+    <$> o .: "facetHits"
+
+searchFacetValues :: IndexName a -> FacetName -> FacetQuery -> Result FacetHits
+searchFacetValues ix f q = do
+  c <- getter <$> ask
+  m <- liftIO getGlobalManager
+  let r = (mkReadRequest c)
+          { path = [uri|/v1/indexes/{ix}/facets/{f}/query|]
+          , method = methodPost
+          }
+  -- TODO add query to body
+  -- object ["params" .= "facetQuery=?&params=?&maxFacetHits=10"]
+  liftIO $ withResponse r m $ \resp -> do
+    aesonReader $ responseBody resp
+
+{-
 newtype SynonymId = SynonymId { fromSynonymId :: Text }
 data Correction = Correction
   { correctionWord :: Text
