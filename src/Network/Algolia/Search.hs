@@ -5,12 +5,90 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
-module Network.Algolia.Search where
+{-# LANGUAGE ScopedTypeVariables #-}
+module Network.Algolia.Search
+  ( mkAlgoliaClient
+  , simpleAlgolia
+  , algoliaFromEnv
+  , withApiKey
+  , Result
+  , IndexName(..)
+  , ObjectId(..)
+  , TaskId(..)
+  , IndexInfo(..)
+  , ListIndicesResponse(..)
+  , listIndices
+  , SearchParameters(..)
+  , defaultQuery
+  , SearchResult(..)
+  , FacetStat(..)
+  , SearchResults(..)
+  , searchIndex
+  -- , searchMultipleIndices
+  , DeleteIndexResponse(..)
+  , deleteIndex
+  , clearIndex
+  , AddObjectWithoutIdResponse(..)
+  , addObjectWithoutId
+  , AddObjectByIdResponse(..)
+  , addObjectById
+  , UpdateOp(..)
+  , ObjectResponse(..)
+  , partiallyUpdateObject
+  -- , retrieveObject
+  -- , retrieveObjects
+  , DeleteObjectResponse(..)
+  , deleteObject
+  , BatchOp(..)
+  , BatchResponse(..)
+  , batch
+  , BatchMultipleIndicesResponse(..)
+  , batchMultipleIndices
+  -- , browseAllIndexContent
+  -- , changeIndexSettings
+  , IndexOperation(..)
+  , IndexOperationResponse(..)
+  , copyOrMoveIndex
+  , TaskStatus(..)
+  , TaskStatusResult(..)
+  , getTaskStatus
+  -- , addIndexApiKey
+  -- , updateIndexApiKey
+  -- , listIndexApiKeys
+  -- , listIndexApiKeysForAllIndices
+  -- , retrieveIndexApiKey
+  -- , deleteIndexApiKey
+  , FacetName(..)
+  , FacetQuery(..)
+  , FacetHit(..)
+  , FacetHits(..)
+  , searchFacetValues
+  , SynonymId(..)
+  , Synonym(..)
+  , Correction(..)
+  -- , setSynonym
+  -- , batchSynonyms
+  -- , getSynonym
+  -- , deleteAllSynonyms
+  -- , deleteSynonymSet
+  , SynonymType(..)
+  , SynonymSearch(..)
+  , SynonymSearchResponse(..)
+  , searchSynonyms
+  -- , addApiKey
+  -- , updateApiKey
+  -- , listApiKeys
+  -- , getApiKey
+  -- , deleteApiKey
+  -- , getLogs
+  , AlgoliaError(..)
+  ) where
+import Control.Exception
 import Control.Monad.Catch
 import Control.Monad.Reader
 import qualified Data.Attoparsec.ByteString as A
 import Data.Aeson.Parser
-import Data.ByteString.Char8 (ByteString, unpack)
+import Data.ByteString.Char8 (ByteString, unpack, pack)
 import Data.Has
 import Data.Hashable
 import Data.HashMap.Strict (HashMap)
@@ -30,6 +108,7 @@ import Network.HTTP.Client.TLS
 import Network.HTTP.Types
 import Network.URI.Template
 import qualified Network.URI.Template as URI
+import System.Environment
 
 data AlgoliaClient = AlgoliaClient
   { algoliaClientFallbackUrls :: Vector Text
@@ -43,9 +122,16 @@ mkAlgoliaClient k aid = AlgoliaClient mempty k aid
 simpleAlgolia :: (MonadIO m, Has AlgoliaClient c) => c -> ReaderT c m a -> m a
 simpleAlgolia = flip runReaderT
 
+algoliaFromEnv :: (MonadIO m) => ReaderT AlgoliaClient m a -> m a
+algoliaFromEnv m = do
+  k <- liftIO $ getEnv "ALGOLIA_KEY"
+  i <- liftIO $ getEnv "ALGOLIA_APP_ID"
+  simpleAlgolia (mkAlgoliaClient (pack k) (pack i)) m
+
 data AlgoliaError
   = JsonParseError String
   | NonConformingResult Value String
+  | ToJsonInstanceMustProduceAnObject
   deriving (Show, Typeable)
 
 instance Exception AlgoliaError
@@ -104,13 +190,15 @@ withApiKey k = local (\a -> a { algoliaClientApiKey = k })
 type Result a = forall c m. (Has AlgoliaClient c, MonadReader c m, MonadThrow m, MonadIO m) => m a
 
 newtype IndexName a = IndexName { fromIndexName :: ByteString }
-  deriving (Show, Eq)
+  deriving (Show, Eq, Hashable)
 
 instance ToJSON (IndexName a) where
   toJSON = toJSON . decodeUtf8 . fromIndexName
 
 instance FromJSON (IndexName a) where
   parseJSON = withText "IndexName" (return . IndexName . encodeUtf8)
+
+instance FromJSONKey (IndexName a)
 
 instance ToTemplateValue (IndexName a) where
   toTemplateValue = Single . unpack . fromIndexName
@@ -134,7 +222,7 @@ instance ToTemplateValue TaskId where
   toTemplateValue = toTemplateValue . fromTaskId
 
 data IndexInfo = IndexInfo
-  { indexInfoName :: Text
+  { indexInfoName :: IndexName Object
   , indexInfoCreatedAt :: UTCTime
   , indexInfoUpdatedAt :: UTCTime
   , indexInfoEntries :: Int
@@ -350,6 +438,7 @@ instance FromJSON a => FromJSON (SearchResults a) where
     <*> r .:? "facets"
     <*> r .:? "facets_stats"
     <*> r .:? "exhaustiveFacetsCount"
+
 -- | Return objects that match the query.
 --
 -- You can find the list of parameters that you can use in the POST body in the Search Parameters section.
@@ -462,12 +551,24 @@ addObjectById ix i val = do
     aesonReader $ responseBody resp
 
 data UpdateOp
-  = Set Value
-  | Increment Scientific
+  = Increment Scientific
   | Decrement Scientific
   | Add (Either Scientific Text)
   | Remove (Either Scientific Text)
   | AddUnique (Either Scientific Text)
+
+instance ToJSON UpdateOp where
+  toJSON op = case op of
+    Increment x -> mkOp "Increment" x
+    Decrement x -> mkOp "Decrement" x
+    Add x -> mkOp "Add" $ either toJSON toJSON x
+    Remove x -> mkOp "Remove" $ either toJSON toJSON x
+    AddUnique x -> mkOp "AddUnique" $ either toJSON toJSON x
+    where
+      mkOp :: forall a. ToJSON a => Text -> a -> Value
+      mkOp t x = object [ "_operation" .= t, "value" .= x ]
+
+
 
 data ObjectResponse = ObjectResponse
 
@@ -498,9 +599,98 @@ deleteObject ix i = do
   liftIO $ withResponse r m $ \resp -> do
     aesonReader $ responseBody resp
 
+data BatchOp a
+  = AddObjectOp a
+  | UpdateObjectOp (ObjectId a) a
+  | PartialUpdateObjectOp (ObjectId a) (HashMap Text UpdateOp)
+  | PartialUpdateObjectNoCreateOp (ObjectId a) (HashMap Text UpdateOp)
+  | DeleteObjectOp (ObjectId a)
+  | DeleteIndexOp
+  | ClearIndexOp
+
+batchOpObject :: ToJSON a => Maybe (IndexName a) -> BatchOp a -> Value
+batchOpObject mix op = tack $ case op of
+  AddObjectOp x ->
+    [ "action" .= ("addObject" :: Text)
+    , "body" .= x
+    ]
+  UpdateObjectOp oid x ->
+    [ "action" .= ("updateObject" :: Text)
+    , "body" .= injectOid oid x
+    ]
+  PartialUpdateObjectOp oid x ->
+    [ "action" .= ("partialUpdateObject" :: Text)
+    , "body" .= injectOid (ObjectId $ fromObjectId oid) x
+    ]
+  PartialUpdateObjectNoCreateOp oid x ->
+    [ "action" .= ("partialUpdateObjectNoCreate" :: Text)
+    , "body" .= injectOid (ObjectId $ fromObjectId oid) x
+    ]
+  DeleteIndexOp ->
+    [ "action" .= ("delete" :: Text)
+    , "body" .= Object H.empty
+    ]
+  ClearIndexOp ->
+    [ "action" .= ("clear" :: Text)
+    , "body" .= Object H.empty
+    ]
+  where
+    tack = object . maybe id ((:) . ("indexName" .=)) mix
+
+injectOid :: ToJSON a => ObjectId a -> a -> Value
+injectOid oid val = case toJSON val of
+  Object o -> Object $ H.insert "objectID" (toJSON oid) o
+  _ -> throw ToJsonInstanceMustProduceAnObject
+
+data BatchResponse = BatchResponse
+  { batchResponseTaskId :: TaskId
+  , batchResponseObjectIds :: [Maybe (ObjectId Object)]
+  } deriving (Show)
+
+instance FromJSON BatchResponse where
+  parseJSON = withObject "BatchResponse" $ \o -> BatchResponse
+    <$> o .: "taskID"
+    <*> o .: "objectIDs"
+
+batch :: ToJSON a => IndexName a -> [BatchOp a] -> Result BatchResponse
+batch ix ops = do -- TODO catch exceptions from injectOid
+  c <- getter <$> ask
+  m <- liftIO getGlobalManager
+  let val = object
+            [ "requests" .= map (batchOpObject Nothing) ops
+            ]
+  let r = (mkWriteRequest c val)
+          { path = [uri|/1/indexes/{ix}/batch|]
+          , method = methodPost
+          }
+  liftIO $ withResponse r m $ \resp -> do
+    aesonReader $ responseBody resp
+
+data BatchMultipleIndicesResponse = BatchMultipleIndicesResponse
+  { batchMultipleIndicesResponseTaskId :: HashMap (IndexName Object) TaskId
+  , batchMultipleIndicesResponseObjectIds :: [Maybe (ObjectId Object)]
+  } deriving (Show)
+
+instance FromJSON BatchMultipleIndicesResponse where
+  parseJSON = withObject "BatchMultipleIndicesResponse" $ \o -> BatchMultipleIndicesResponse
+    <$> o .: "taskID"
+    <*> o .: "objectIDs"
+
+batchMultipleIndices :: [(IndexName Object, BatchOp Object)] -> Result BatchMultipleIndicesResponse
+batchMultipleIndices ops = do
+  c <- getter <$> ask
+  m <- liftIO getGlobalManager
+  let val = object
+            [ "requests" .= map (\(k, v) -> batchOpObject (Just k) v) ops
+            ]
+  let r = (mkWriteRequest c val)
+          { path = [uri|/1/indexes/*/batch|]
+          , method = methodPost
+          }
+  liftIO $ withResponse r m $ \resp -> do
+    aesonReader $ responseBody resp
+
 {-
-batch
-batchMultipleIndices
 browseAllIndexContent
 changeIndexSettings
 -}
@@ -620,19 +810,22 @@ searchFacetValues ix f q = do
   liftIO $ withResponse r m $ \resp -> do
     aesonReader $ responseBody resp
 
-{-
 newtype SynonymId = SynonymId { fromSynonymId :: Text }
+  deriving (Show, Eq, ToJSON, FromJSON, FromJSONKey)
+
 data Correction = Correction
   { correctionWord :: Text
   , correctionCorrections :: [Text]
   }
 
-data Synonym = MultiWaySynonym [Text]
-             | OneWaySynonym Text [Text]
-             | AlternativeCorrection1 Correction
-             | AlternativeCorrection2 Correction
-             | Placeholder Text [Text]
+data Synonym
+  = MultiWaySynonym [Text]
+  | OneWaySynonym Text [Text]
+  | AlternativeCorrection1 Correction
+  | AlternativeCorrection2 Correction
+  | Placeholder Text [Text]
 
+{-
 setSynonym
   :: IndexName a
   -> SynonymId
@@ -654,18 +847,18 @@ deleteSynonymSet
 -}
 
 data SynonymType
-  = Synonym -- ^ Multi-way synonyms (a.k.a. “regular synonyms”). A set of words or phrases that are all substitutable to one another. Any query containing one of them can match records containing any of them.
-  | OneWaySynonym -- ^ One-way synonym. Alternative matches for a given input. If the input appears inside a query, it will match records containing any of the defined synonyms. The opposite is not true: if a synonym appears in a query, it will not match records containing the input, nor the other synonyms.
-  | AltCorrection1 -- ^ Alternative corrections. Same as a one-way synonym, except that when matched, they will count as 1 (respectively 2) typos in the ranking formula.
-  | AltCorrection2
-  | Placeholder -- ^ A placeholder is a special text token that is placed inside records and can match many inputs. For more information on synonyms, please read our Synonyms guide. https://www.algolia.com/doc/guides/textual-relevance/synonyms/
+  = SynonymTy -- ^ Multi-way synonyms (a.k.a. “regular synonyms”). A set of words or phrases that are all substitutable to one another. Any query containing one of them can match records containing any of them.
+  | OneWaySynonymTy -- ^ One-way synonym. Alternative matches for a given input. If the input appears inside a query, it will match records containing any of the defined synonyms. The opposite is not true: if a synonym appears in a query, it will not match records containing the input, nor the other synonyms.
+  | AltCorrection1Ty -- ^ Alternative corrections. Same as a one-way synonym, except that when matched, they will count as 1 (respectively 2) typos in the ranking formula.
+  | AltCorrection2Ty
+  | PlaceholderTy -- ^ A placeholder is a special text token that is placed inside records and can match many inputs. For more information on synonyms, please read our Synonyms guide. https://www.algolia.com/doc/guides/textual-relevance/synonyms/
 
 synonymTypeName :: SynonymType -> Text
-synonymTypeName Synonym = "synonym"
-synonymTypeName OneWaySynonym = "onewaysynonym"
-synonymTypeName AltCorrection1 = "altcorrection1"
-synonymTypeName AltCorrection2 = "altcorrection2"
-synonymTypeName Placeholder = "placeholder"
+synonymTypeName SynonymTy = "synonym"
+synonymTypeName OneWaySynonymTy = "onewaysynonym"
+synonymTypeName AltCorrection1Ty = "altcorrection1"
+synonymTypeName AltCorrection2Ty = "altcorrection2"
+synonymTypeName PlaceholderTy = "placeholder"
 
 data SynonymSearch = SynonymSearch
   { synonymSearchQuery :: Maybe Text -- ^ Search for specific synonyms matching this string.
@@ -684,7 +877,10 @@ instance ToJSON SynonymSearch where
     , "hitsPerPage" .= synonymSearchHitsPerPage
     ]
 
-type SynonymSearchResponse = Object
+data SynonymSearchResponse = SynonymSearchResponse Object
+
+instance FromJSON SynonymSearchResponse where
+  parseJSON = withObject "SynonymSearchResponse" (return . SynonymSearchResponse)
 
 -- | Search or browse all synonyms, optionally filtering them by type.
 searchSynonyms :: IndexName a -> SynonymSearch -> Result SynonymSearchResponse

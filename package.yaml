@@ -30,6 +30,7 @@ library:
   - data-has
   - vector
   - hashable
+  - dotenv
 tests:
   algolia-test:
     main: Spec.hs

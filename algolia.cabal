@@ -50,6 +50,7 @@ library
     , data-has
     , vector
     , hashable
+    , dotenv
   default-language: Haskell2010
 
 test-suite algolia-test
