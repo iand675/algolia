@@ -30,6 +30,8 @@ library:
   - data-has
   - vector
   - hashable
+  - cryptonite
+  - memory
   - dotenv
 tests:
   algolia-test:

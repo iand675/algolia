@@ -8,6 +8,9 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 module Network.Algolia.Search
   ( mkAlgoliaClient
+  , AlgoliaClient
+  , ApiKey(..)
+  , ApplicationId(..)
   , simpleAlgolia
   , algoliaFromEnv
   , withApiKey
@@ -21,10 +24,12 @@ module Network.Algolia.Search
   , SearchParameters(..)
   , defaultQuery
   , SearchResult(..)
+  , generateSecuredApiKey
   , FacetStat(..)
   , SearchResults(..)
   , searchIndex
-  -- , searchMultipleIndices
+  , MultiIndexSearchStrategy(..)
+  , searchMultipleIndices
   , DeleteIndexResponse(..)
   , deleteIndex
   , clearIndex
@@ -80,19 +85,26 @@ module Network.Algolia.Search
   -- , listApiKeys
   -- , getApiKey
   -- , deleteApiKey
-  -- , getLogs
+  , LogType(..)
+  , LogsResponse(..)
+  , getLogs
   , AlgoliaError(..)
   ) where
 import Control.Exception
 import Control.Monad.Catch
 import Control.Monad.Reader
+import Crypto.Hash.Algorithms
+import Crypto.MAC.HMAC
 import qualified Data.Attoparsec.ByteString as A
 import Data.Aeson.Parser
+import Data.ByteArray.Encoding
 import Data.ByteString.Char8 (ByteString, unpack, pack)
+import qualified Data.ByteString.Lazy as L
 import Data.Has
 import Data.Hashable
 import Data.HashMap.Strict (HashMap)
 import qualified Data.HashMap.Strict as H
+import Data.Maybe
 import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Text.Encoding (encodeUtf8, decodeUtf8)
@@ -106,17 +118,21 @@ import Data.String
 import Network.HTTP.Client
 import Network.HTTP.Client.TLS
 import Network.HTTP.Types
+import Network.HTTP.Types.QueryLike
 import Network.URI.Template
 import qualified Network.URI.Template as URI
 import System.Environment
 
+newtype ApiKey = ApiKey { fromApiKey :: ByteString }
+newtype ApplicationId = ApplicationId { fromApplicationId :: ByteString}
+
 data AlgoliaClient = AlgoliaClient
   { algoliaClientFallbackUrls :: Vector Text
-  , algoliaClientApiKey :: ByteString
-  , algoliaClientApplicationId :: ByteString
+  , algoliaClientApiKey :: ApiKey
+  , algoliaClientApplicationId :: ApplicationId
   }
 
-mkAlgoliaClient :: ByteString -> ByteString -> AlgoliaClient
+mkAlgoliaClient :: ApiKey -> ApplicationId -> AlgoliaClient
 mkAlgoliaClient k aid = AlgoliaClient mempty k aid
 
 simpleAlgolia :: (MonadIO m, Has AlgoliaClient c) => c -> ReaderT c m a -> m a
@@ -126,7 +142,7 @@ algoliaFromEnv :: (MonadIO m) => ReaderT AlgoliaClient m a -> m a
 algoliaFromEnv m = do
   k <- liftIO $ getEnv "ALGOLIA_KEY"
   i <- liftIO $ getEnv "ALGOLIA_APP_ID"
-  simpleAlgolia (mkAlgoliaClient (pack k) (pack i)) m
+  simpleAlgolia (mkAlgoliaClient (ApiKey $ pack k) (ApplicationId $ pack i)) m
 
 data AlgoliaError
   = JsonParseError String
@@ -152,9 +168,9 @@ aesonReader m = do
 
 mkBaseRequest :: AlgoliaClient -> Request
 mkBaseRequest AlgoliaClient{..} = defaultRequest
-  { requestHeaders =
-      [ ("X-Algolia-Application-Id", algoliaClientApplicationId)
-      , ("X-Algolia-API-Key", algoliaClientApiKey)
+  { requestHeaders = -- ("X-Algolia-UserToken"), ("X-Algolia-Agent", _), ("X-Algolia-TagFilters", _)
+      [ ("X-Algolia-Application-Id", fromApplicationId algoliaClientApplicationId)
+      , ("X-Algolia-API-Key", fromApiKey algoliaClientApiKey)
       , (hContentType, "application/json; charset=UTF-8")
       ]
   , secure = True
@@ -166,7 +182,7 @@ mkReadRequest c@AlgoliaClient{..} = (mkBaseRequest c)
   { host = [uri|{strHost}-dsn.algolia.net|]
   }
   where
-    strHost = URI.String $ unpack algoliaClientApplicationId
+    strHost = URI.String $ unpack $ fromApplicationId algoliaClientApplicationId
 
 mkWriteRequest :: ToJSON a => AlgoliaClient -> a -> Request
 mkWriteRequest c@AlgoliaClient{..} x = (mkBaseRequest c)
@@ -174,7 +190,7 @@ mkWriteRequest c@AlgoliaClient{..} x = (mkBaseRequest c)
   , requestBody = RequestBodyLBS $ encode x
   }
   where
-    strHost = URI.String $ unpack algoliaClientApplicationId
+    strHost = URI.String $ unpack $ fromApplicationId algoliaClientApplicationId
 
 
 mkWriteRequest' :: AlgoliaClient -> Request
@@ -182,9 +198,9 @@ mkWriteRequest' c@AlgoliaClient{..} = (mkBaseRequest c)
   { host = [uri|{strHost}.algolia.net}|]
   }
   where
-    strHost = URI.String $ unpack algoliaClientApplicationId
+    strHost = URI.String $ unpack $ fromApplicationId algoliaClientApplicationId
 
-withApiKey :: MonadReader AlgoliaClient m => ByteString -> m a -> m a
+withApiKey :: MonadReader AlgoliaClient m => ApiKey -> m a -> m a
 withApiKey k = local (\a -> a { algoliaClientApiKey = k })
 
 type Result a = forall c m. (Has AlgoliaClient c, MonadReader c m, MonadThrow m, MonadIO m) => m a
@@ -456,9 +472,32 @@ searchIndex ix params = do
   liftIO $ withResponse r m $ \resp -> do
     aesonReader $ responseBody resp
 
-{-
-searchMultipleIndices
--}
+data MultiIndexSearchStrategy
+  = None
+  | StopIfEnoughMatches
+  deriving (Show, Eq)
+
+instance ToJSON MultiIndexSearchStrategy where
+  toJSON strat =
+    case strat of
+      None -> "none"
+      StopIfEnoughMatches -> "stopIfEnoughMatches"
+
+-- TODO gotta actually pull the results out of the output, right?
+searchMultipleIndices :: [(IndexName Object, Query)] -> Maybe MultiIndexSearchStrategy -> Result [SearchResults Object]
+searchMultipleIndices searches strat = do
+  c <- getter <$> ask
+  m <- liftIO getGlobalManager
+  let r = (mkReadRequest c)
+          { path = [uri|/1/indexes/*/query|]
+          , method = methodPost
+          , requestBody = RequestBodyLBS $ encode $ object
+            [ "requests" .= map (\(ix, o) -> object ["indexName" .= ix, "params" .= decodeUtf8 (renderQuery False o)]) searches
+            , "strategy" .= fromMaybe None strat
+            ]
+          }
+  liftIO $ withResponse r m $ \resp -> do
+    aesonReader $ responseBody resp
 
 data DeleteIndexResponse = DeleteIndexResponse
   { deleteIndexResponseDeletedAt :: UTCTime
@@ -901,6 +940,62 @@ updateApiKey
 listApiKeys
 getApiKey
 deleteApiKey
-getLogs
-
 -}
+
+data LogType
+  = AllLogs
+  | QueryLogs
+  | BuildLogs
+  | ErrorLogs
+  deriving (Show)
+
+data LogsResponse = LogsResponse
+  { logsResponseResults :: [Object]
+  } deriving (Show)
+
+instance FromJSON LogsResponse where
+  parseJSON = withObject "LogsResponse" $ \r ->
+    LogsResponse <$> r .: "logs"
+
+getLogs ::
+     Maybe Int -- ^ Offset
+  -> Maybe Int -- ^ Length
+  -> Maybe (IndexName a)
+  -> Maybe LogType
+  -> Result LogsResponse
+getLogs o l ix t = do
+  c <- getter <$> ask
+  m <- liftIO getGlobalManager
+  let r = (mkReadRequest c)
+          { path = [uri|/1/logs{?params*}|]
+          , method = methodGet
+          }
+  liftIO $ withResponse r m $ \resp -> do
+    aesonReader $ responseBody resp
+  where
+    params = AList (("offset" :: Text, fmap (T.pack . show) o) : ("length", fmap (T.pack . show) l) : ("type", fmap renderTy t) : ("indexName", (decodeUtf8 . fromIndexName) <$> ix) : [])
+    renderTy ty = case ty of
+      AllLogs -> "all"
+      QueryLogs -> "query"
+      BuildLogs -> "build"
+      ErrorLogs -> "error"
+
+-- Test cases:
+--
+-- generateSecuredApiKey (ApiKey "Keyyyy") [("tagFilters", Just "yoyo")] (Just "user_42")
+--
+-- > "MzdjZmI1YjFhM2E4YmZmOGU5NjA2Y2FhYmQ1NzM2MGVkNjZlODIxZTFlMWU4M2MwZjNhM2U0YWRiMTRhYzBkNXRhZ0ZpbHRlcnM9eW95byZ1c2VyVG9rZW49dXNlcl80Mg=="
+--
+-- Notice here how tag filter array gets encoded as json array
+-- generateSecuredApiKey (ApiKey "Keyyyy") [("tagFilters", Just "[\"yoyo\"]")] (Jus "user_42")
+--
+-- > "MjE5YWUyZTQ4NDViM2QzMjRmZTU1MzJmNzAyOWJjZmU0YWFjZWFkZTI0ODI0YTM4YmZkYTlmYTYyZjA3NmVmYXRhZ0ZpbHRlcnM9JTVCJTIyeW95byUyMiU1RCZ1c2VyVG9rZW49dXNlcl80Mg=="
+generateSecuredApiKey :: ApiKey -> Query -> Maybe ByteString -> ByteString
+generateSecuredApiKey privateKey qps' userKey = convertToBase Base64 (hmac <> qps)
+  where
+    ctxt :: Context SHA256
+    ctxt = initialize $ fromApiKey privateKey
+    hmac = convertToBase Base16 $ hmacGetDigest $ finalize $ update ctxt qps
+    qps = case userKey of
+      Nothing -> renderQuery False qps'
+      Just uk -> renderQuery False (qps' <> [("userToken", Just uk)])

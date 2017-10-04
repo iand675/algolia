@@ -50,6 +50,8 @@ library
     , data-has
     , vector
     , hashable
+    , cryptonite
+    , memory
     , dotenv
   default-language: Haskell2010
 
