@@ -2,6 +2,3 @@
 :set -isrc
 :set -XOverloadedStrings
 :load Network.Algolia.Search
-:m + Configuration.Dotenv Configuration.Dotenv.Types
-loadFile defaultConfig
-:m - Configuration.Dotenv Configuration.Dotenv.Types

@@ -32,7 +32,6 @@ library:
   - hashable
   - cryptonite
   - memory
-  - dotenv
 tests:
   algolia-test:
     main: Spec.hs
@@ -42,5 +41,9 @@ tests:
     - -rtsopts
     - -with-rtsopts=-N
     dependencies:
+    - tasty
+    - tasty-discover
+    - tasty-hunit
     - base
     - algolia
+    - aeson

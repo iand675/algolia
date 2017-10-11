@@ -6,6 +6,7 @@
 {-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE DefaultSignatures #-}
 module Network.Algolia.Search
   ( mkAlgoliaClient
   , AlgoliaClient
@@ -15,6 +16,7 @@ module Network.Algolia.Search
   , algoliaFromEnv
   , withApiKey
   , Result
+  , Reconstrain(..)
   , IndexName(..)
   , ObjectId(..)
   , TaskId(..)
@@ -40,8 +42,9 @@ module Network.Algolia.Search
   , UpdateOp(..)
   , ObjectResponse(..)
   , partiallyUpdateObject
-  -- , retrieveObject
-  -- , retrieveObjects
+  , RetrieveObjectResponse(..)
+  , retrieveObject
+  , retrieveObjects
   , DeleteObjectResponse(..)
   , deleteObject
   , BatchOp(..)
@@ -90,6 +93,7 @@ module Network.Algolia.Search
   , getLogs
   , AlgoliaError(..)
   ) where
+import Control.Applicative
 import Control.Exception
 import Control.Monad.Catch
 import Control.Monad.Reader
@@ -100,6 +104,7 @@ import Data.Aeson.Parser
 import Data.ByteArray.Encoding
 import Data.ByteString.Char8 (ByteString, unpack, pack)
 import qualified Data.ByteString.Lazy as L
+import Data.Coerce
 import Data.Has
 import Data.Hashable
 import Data.HashMap.Strict (HashMap)
@@ -237,23 +242,31 @@ newtype TaskId = TaskId { fromTaskId :: Int }
 instance ToTemplateValue TaskId where
   toTemplateValue = toTemplateValue . fromTaskId
 
+class Reconstrain f where
+  reconstrain :: f a -> f b
+  default reconstrain :: Coercible (f a) (f b) => f a -> f b
+  reconstrain = coerce
+
+instance Reconstrain ObjectId
+instance Reconstrain IndexName
+
 data IndexInfo = IndexInfo
   { indexInfoName :: IndexName Object
-  , indexInfoCreatedAt :: UTCTime
-  , indexInfoUpdatedAt :: UTCTime
+  -- , indexInfoCreatedAt :: UTCTime
+  -- , indexInfoUpdatedAt :: UTCTime
   , indexInfoEntries :: Int
   , indexInfoDataSize :: Int
   , indexInfoFileSize :: Int
   , indexInfoLastBuildTimeS :: Int
   , indexInfoNumberOfPendingTask :: Int
   , indexInfoPendingTask :: Bool
-  } deriving (Show)
+  } deriving (Show, Eq)
 
 instance FromJSON IndexInfo where
   parseJSON = withObject "IndexInfo" $ \r -> IndexInfo
     <$> r .: "name"
-    <*> r .: "createdAt"
-    <*> r .: "updatedAt"
+    -- <*> r .: "createdAt"
+    -- <*> r .: "updatedAt"
     <*> r .: "entries"
     <*> r .: "dataSize"
     <*> r .: "fileSize"
@@ -264,7 +277,7 @@ instance FromJSON IndexInfo where
 data ListIndicesResponse = ListIndicesResponse
   { listIndicesResponseItems :: [IndexInfo]
   , listIndicesResponseNbPages :: Int
-  } deriving (Show)
+  } deriving (Show, Eq)
 
 instance FromJSON ListIndicesResponse where
   parseJSON = withObject "ListIndicesResponse" $ \r -> ListIndicesResponse
@@ -613,10 +626,72 @@ data ObjectResponse = ObjectResponse
 
 partiallyUpdateObject :: IndexName a -> HashMap Text UpdateOp -> Result ObjectResponse
 partiallyUpdateObject = undefined
-{-
-retrieveObject :: FromJSON a => IndexName a -> ObjectId a -> [Text] -> Result (Maybe a)
-retrieveObjects :: FromJSON a => [(IndexName Object, ObjectId Object, Maybe [Text])] -> Result [Object]
--}
+
+data RetrieveObjectResponse a = RetrieveObjectResponse
+  { retrieveObjectResponseObjectId :: !(ObjectId a)
+  , retrieveObjectResponseObject :: a
+  } deriving (Show, Eq)
+
+instance FromJSON a => FromJSON (RetrieveObjectResponse a) where
+  parseJSON = withObject "RetrieveObjectResponse" $ \o -> do
+    oid <- o .: "objectID"
+    val <- parseJSON (Object $ H.delete "objectID" o) <|> parseJSON (Object o)
+    return $ RetrieveObjectResponse oid val
+
+retrieveObject
+  :: FromJSON a
+  => IndexName a
+  -> ObjectId a
+  -> [Text] -- ^ Attributes to retrieve. An empty list denotes retriving all attributes.
+            -- Note that the FromJSON instance might not succeed if you exclude attributes, so
+            -- it might be necessary to use @reconstrain@ on the index and id to use a different
+            -- FromJSON instance
+  -> Result (Maybe (RetrieveObjectResponse a))
+retrieveObject ix oid attrs = do
+  c <- getter <$> ask
+  m <- liftIO getGlobalManager
+  let r = (mkReadRequest c)
+          { path = case attrs of
+              [] -> [uri|/1/indexes/{ix}/{oid}|]
+              attributesToRetrieve -> [uri|/1/indexes/{ix}/{oid}{?attributesToRetrieve}|]
+          , method = methodGet
+          }
+  liftIO $ withResponse r m $ \resp -> do
+    aesonReader $ responseBody resp
+
+newtype RetrieveObjectResults = RetrieveObjectResults { fromRetrieveObjectResults :: [Object] }
+  deriving (Show, Eq)
+
+instance FromJSON RetrieveObjectResults where
+  parseJSON = withObject "RetrieveObjectResults" $ \rs -> do
+    RetrieveObjectResults <$> rs .: "results"
+
+retrieveObjects :: [(IndexName Object, ObjectId Object, [Text])] -> Result [Object]
+retrieveObjects os = do
+  c <- getter <$> ask
+  m <- liftIO getGlobalManager
+  let r = (mkReadRequest c)
+          { path = [uri|/1/indexes/*/objects|]
+          , method = methodPost
+          , requestBody = RequestBodyLBS $ encode $ object
+            [ "requests" .= map something os
+            ]
+          }
+  fmap fromRetrieveObjectResults $ liftIO $ withResponse r m $ \resp -> do
+    aesonReader $ responseBody resp
+
+  where
+    something (ix, oid, ts) = object $ case ts of
+      [] ->
+        [ "indexName" .= ix
+        , "objectID" .= oid
+        ]
+      as ->
+        [ "indexName" .= ix
+        , "objectID" .= oid
+        , "attributesToRetrieve" .= ts
+        ]
+
 data DeleteObjectResponse = DeleteObjectResponse
   { deleteObjectResponseDeletedAt :: UTCTime
   , deleteObjectResponseTaskId :: TaskId
@@ -980,16 +1055,6 @@ getLogs o l ix t = do
       BuildLogs -> "build"
       ErrorLogs -> "error"
 
--- Test cases:
---
--- generateSecuredApiKey (ApiKey "Keyyyy") [("tagFilters", Just "yoyo")] (Just "user_42")
---
--- > "MzdjZmI1YjFhM2E4YmZmOGU5NjA2Y2FhYmQ1NzM2MGVkNjZlODIxZTFlMWU4M2MwZjNhM2U0YWRiMTRhYzBkNXRhZ0ZpbHRlcnM9eW95byZ1c2VyVG9rZW49dXNlcl80Mg=="
---
--- Notice here how tag filter array gets encoded as json array
--- generateSecuredApiKey (ApiKey "Keyyyy") [("tagFilters", Just "[\"yoyo\"]")] (Jus "user_42")
---
--- > "MjE5YWUyZTQ4NDViM2QzMjRmZTU1MzJmNzAyOWJjZmU0YWFjZWFkZTI0ODI0YTM4YmZkYTlmYTYyZjA3NmVmYXRhZ0ZpbHRlcnM9JTVCJTIyeW95byUyMiU1RCZ1c2VyVG9rZW49dXNlcl80Mg=="
 generateSecuredApiKey :: ApiKey -> Query -> Maybe ByteString -> ByteString
 generateSecuredApiKey privateKey qps' userKey = convertToBase Base64 (hmac <> qps)
   where
