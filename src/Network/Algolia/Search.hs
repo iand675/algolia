@@ -52,13 +52,15 @@ module Network.Algolia.Search
   , batch
   , BatchMultipleIndicesResponse(..)
   , batchMultipleIndices
-  -- , browseAllIndexContent
+  , BrowseIndexResponse(..)
+  , browseAllIndexContent
   -- , changeIndexSettings
   , IndexOperation(..)
   , IndexOperationResponse(..)
   , copyOrMoveIndex
   , TaskStatus(..)
   , TaskStatusResult(..)
+  , waitTask
   , getTaskStatus
   -- , addIndexApiKey
   -- , updateIndexApiKey
@@ -95,6 +97,7 @@ module Network.Algolia.Search
   ) where
 import Control.Applicative
 import Control.Exception
+import Control.Retry
 import Control.Monad.Catch
 import Control.Monad.Reader
 import Crypto.Hash.Algorithms
@@ -151,23 +154,23 @@ algoliaFromEnv m = do
 
 data AlgoliaError
   = JsonParseError String
-  | NonConformingResult Value String
+  | NonConformingResult Request (Response ()) Value String
   | ToJsonInstanceMustProduceAnObject
   deriving (Show, Typeable)
 
 instance Exception AlgoliaError
 
-aesonReader :: (MonadIO m, MonadThrow m, FromJSON a) => IO ByteString -> m a
-aesonReader m = do
-  s <- liftIO m
+aesonReader :: (MonadIO m, MonadThrow m, FromJSON a) => Request -> Response BodyReader -> m a
+aesonReader req m = do
+  s <- liftIO (responseBody m)
   r <- go (A.parse value' s)
   case fromJSON r of
-    Error e -> throwM $ NonConformingResult r e
+    Error e -> throwM $ NonConformingResult req (m { responseBody = () }) r e
     Success x -> return x
   where
     go (A.Fail _ _ err) = throwM $ JsonParseError err
     go (A.Partial f) = do
-      s <- liftIO m
+      s <- liftIO (responseBody m)
       go (f s)
     go (A.Done _ r) = return r
 
@@ -297,7 +300,7 @@ listIndices _ {- TODO -} = do
           , method = methodGet
           }
   liftIO $ withResponse r m $ \resp -> do
-    aesonReader $ responseBody resp
+    aesonReader r resp
 
 data SearchParameters = SearchParameters
   { query :: Text
@@ -483,7 +486,7 @@ searchIndex ix params = do
           , requestBody = RequestBodyLBS $ encode params
           }
   liftIO $ withResponse r m $ \resp -> do
-    aesonReader $ responseBody resp
+    aesonReader r resp
 
 data MultiIndexSearchStrategy
   = None
@@ -510,7 +513,7 @@ searchMultipleIndices searches strat = do
             ]
           }
   liftIO $ withResponse r m $ \resp -> do
-    aesonReader $ responseBody resp
+    aesonReader r resp
 
 data DeleteIndexResponse = DeleteIndexResponse
   { deleteIndexResponseDeletedAt :: UTCTime
@@ -532,7 +535,7 @@ deleteIndex ix = do
           , method = methodDelete
           }
   liftIO $ withResponse r m $ \resp -> do
-    aesonReader $ responseBody resp
+    aesonReader r resp
 
 -- | Delete an index’s content, but leave settings and index-specific API keys untouched.
 clearIndex :: IndexName a -> Result IndexOperationResponse
@@ -544,7 +547,7 @@ clearIndex ix = do
           , method = methodPost
           }
   liftIO $ withResponse r m $ \resp -> do
-    aesonReader $ responseBody resp
+    aesonReader r resp
 
 data AddObjectWithoutIdResponse a = AddObjectWithoutIdResponse
   { addObjectWithoutIdResponseCreatedAt :: UTCTime
@@ -570,7 +573,7 @@ addObjectWithoutId ix val = do
           , method = methodPost
           }
   liftIO $ withResponse r m $ \resp -> do
-    aesonReader $ responseBody resp
+    aesonReader r resp
 
 data AddObjectByIdResponse a = AddObjectByIdResponse
   { addObjectByIdResponseUpdatedAt :: UTCTime
@@ -600,7 +603,7 @@ addObjectById ix i val = do
           , method = methodPut
           }
   liftIO $ withResponse r m $ \resp -> do
-    aesonReader $ responseBody resp
+    aesonReader r resp
 
 data UpdateOp
   = Increment Scientific
@@ -657,7 +660,7 @@ retrieveObject ix oid attrs = do
           , method = methodGet
           }
   liftIO $ withResponse r m $ \resp -> do
-    aesonReader $ responseBody resp
+    aesonReader r resp
 
 newtype RetrieveObjectResults = RetrieveObjectResults { fromRetrieveObjectResults :: [Object] }
   deriving (Show, Eq)
@@ -678,7 +681,7 @@ retrieveObjects os = do
             ]
           }
   fmap fromRetrieveObjectResults $ liftIO $ withResponse r m $ \resp -> do
-    aesonReader $ responseBody resp
+    aesonReader r resp
 
   where
     something (ix, oid, ts) = object $ case ts of
@@ -711,7 +714,7 @@ deleteObject ix i = do
           , method = methodDelete
           }
   liftIO $ withResponse r m $ \resp -> do
-    aesonReader $ responseBody resp
+    aesonReader r resp
 
 data BatchOp a
   = AddObjectOp a
@@ -778,7 +781,7 @@ batch ix ops = do -- TODO catch exceptions from injectOid
           , method = methodPost
           }
   liftIO $ withResponse r m $ \resp -> do
-    aesonReader $ responseBody resp
+    aesonReader r resp
 
 data BatchMultipleIndicesResponse = BatchMultipleIndicesResponse
   { batchMultipleIndicesResponseTaskId :: HashMap (IndexName Object) TaskId
@@ -802,10 +805,48 @@ batchMultipleIndices ops = do
           , method = methodPost
           }
   liftIO $ withResponse r m $ \resp -> do
-    aesonReader $ responseBody resp
+    aesonReader r resp
 
+newtype Cursor a = Cursor { fromCursor :: Text }
+  deriving (Show, Eq, ToJSON, FromJSON)
+
+data BrowseIndexResponse a = BrowseIndexResponse
+  { browseIndexResponseCursor :: Maybe (Cursor a)
+  , browseIndexResponseHits :: !(Vector (RetrieveObjectResponse a))
+  , browseIndexResponsePage :: !Int
+  , browseIndexResponseNumberOfHits :: !Int
+  , browseIndexResponseNumberOfPages :: !Int
+  , browseIndexResponseHitsPerPage :: !Int
+  , browseIndexResponseProcessingTimeMs :: !Int
+  , browseIndexResponseQuery :: !Text
+  , browseIndexResponseParams :: !Text
+  }
+
+instance (FromJSON a) => FromJSON (BrowseIndexResponse a) where
+  parseJSON = withObject "BrowseIndexResponse" $ \o ->
+    BrowseIndexResponse <$>
+    o .:? "cursor" <*>
+    o .: "hits" <*>
+    o .: "page" <*>
+    o .: "nbHits" <*>
+    o .: "nbPages" <*>
+    o .: "hitsPerPage" <*>
+    o .: "processingTimeMS" <*>
+    o .: "query" <*>
+    o .: "params"
+
+-- TODO support params
+browseAllIndexContent :: FromJSON a => IndexName a -> Result (BrowseIndexResponse a)
+browseAllIndexContent ix = do
+  c <- getter <$> ask
+  m <- liftIO getGlobalManager
+  let r = (mkReadRequest c)
+          { path = [uri|/1/indexes/{ix}/browse|]
+          , method = methodGet
+          }
+  liftIO $ withResponse r m $ \resp -> do
+    aesonReader r resp
 {-
-browseAllIndexContent
 changeIndexSettings
 -}
 
@@ -842,10 +883,10 @@ copyOrMoveIndex op from to = do
         { path = [uri|/1/indexes/{from}/operation|] -- "/1/indexes/" <> fromIndexName from <> "/operation"
         , method = methodPost
         }
-  liftIO $ withResponse r m $ \resp -> do aesonReader $ responseBody resp
+  liftIO $ withResponse r m $ \resp -> do aesonReader r resp
 
 data TaskStatus = Published | NotPublished
-  deriving (Show)
+  deriving (Show, Eq)
 
 instance FromJSON TaskStatus where
   parseJSON = withText "TaskStatus" $ \t -> case t of
@@ -868,11 +909,11 @@ getTaskStatus ix t = do
   c <- getter <$> ask
   m <- liftIO getGlobalManager
   let r = (mkReadRequest c)
-          { path = [uri|/v1/indexes/{ix}/task/{t}|]
-          , method = methodPost
+          { path = [uri|/1/indexes/{ix}/task/{t}|]
+          , method = methodGet
           }
   liftIO $ withResponse r m $ \resp -> do
-    aesonReader $ responseBody resp
+    aesonReader r resp
 {-
 addIndexApiKey
 updateIndexApiKey
@@ -916,13 +957,13 @@ searchFacetValues ix f q = do
   c <- getter <$> ask
   m <- liftIO getGlobalManager
   let r = (mkReadRequest c)
-          { path = [uri|/v1/indexes/{ix}/facets/{f}/query|]
+          { path = [uri|/1/indexes/{ix}/facets/{f}/query|]
           , method = methodPost
           }
   -- TODO add query to body
   -- object ["params" .= "facetQuery=?&params=?&maxFacetHits=10"]
   liftIO $ withResponse r m $ \resp -> do
-    aesonReader $ responseBody resp
+    aesonReader r resp
 
 newtype SynonymId = SynonymId { fromSynonymId :: Text }
   deriving (Show, Eq, ToJSON, FromJSON, FromJSONKey)
@@ -1007,7 +1048,7 @@ searchSynonyms ix params = do
           , requestBody = RequestBodyLBS $ encode params
           }
   liftIO $ withResponse r m $ \resp -> do
-    aesonReader $ responseBody resp
+    aesonReader r resp
 
 {-
 addApiKey
@@ -1046,7 +1087,7 @@ getLogs o l ix t = do
           , method = methodGet
           }
   liftIO $ withResponse r m $ \resp -> do
-    aesonReader $ responseBody resp
+    aesonReader r resp
   where
     params = AList (("offset" :: Text, fmap (T.pack . show) o) : ("length", fmap (T.pack . show) l) : ("type", fmap renderTy t) : ("indexName", (decodeUtf8 . fromIndexName) <$> ix) : [])
     renderTy ty = case ty of
@@ -1064,3 +1105,18 @@ generateSecuredApiKey privateKey qps' userKey = convertToBase Base64 (hmac <> qp
     qps = case userKey of
       Nothing -> renderQuery False qps'
       Just uk -> renderQuery False (qps' <> [("userToken", Just uk)])
+
+waitTask :: IndexName a -> TaskId -> Result ()
+waitTask ix taskId =
+  void $
+  retrying
+    (capDelay 5000000 (exponentialBackoff 100000))
+    statusChecker
+    statusGetter
+  where
+    statusGetter _ = getTaskStatus ix taskId
+    statusChecker _ status =
+      return $
+      case taskStatusResultStatus status of
+        NotPublished -> True
+        Published -> False

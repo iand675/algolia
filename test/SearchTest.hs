@@ -31,6 +31,17 @@ unit_listIndices :: IO ()
 unit_listIndices = do
   void $ algoliaFromEnv $ listIndices Nothing
 
+unit_clearIndex :: IO ()
+unit_clearIndex = do
+  let ix = IndexName "hs_client_test_clear_ix" :: IndexName Value
+      contents = object ["body" .= ("stuff" :: String)] :: Value
+  r <- algoliaFromEnv $ do
+    r <- addObjectWithoutId ix contents
+    waitTask ix (addObjectWithoutIdResponseTaskId r)
+    ior <- clearIndex ix
+    waitTask ix (indexOperationResponseTaskId ior)
+    browseAllIndexContent ix
+  Prelude.length (browseIndexResponseHits r) @?= 0
 
 
 
@@ -40,6 +51,7 @@ unit_retrieveObject = do
       contents = object ["body" .= ("stuff" :: String)]
   (newObj, res) <- algoliaFromEnv $ do
     newObj <- addObjectWithoutId ix contents
+    waitTask ix (addObjectWithoutIdResponseTaskId newObj)
     res <- retrieveObject ix (addObjectWithoutIdResponseObjectId newObj) []
     return (newObj, res)
   res @?= Just (RetrieveObjectResponse (addObjectWithoutIdResponseObjectId newObj) contents)
