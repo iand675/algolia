@@ -33,12 +33,14 @@ library
       Network.Algolia.Vault
       Paths_algolia
   build-depends:
-      base >=4.7 && <5
+      aeson
+    , aeson-iproute
+    , base >=4.7 && <5
     , bytestring
-    , aeson
     , http-client
     , http-client-tls
     , http-types
+    , iproute
     , time
     , text
     , scientific

@@ -40,6 +40,7 @@ packages:
 # Dependency packages to be pulled from upstream that are not in the resolver
 # (e.g., acme-missiles-0.3)
 extra-deps:
+- aeson-iproute-0.1.1
 - uri-templater-0.3.1.0
 - data-has-0.3.0.0
 - dotenv-0.5.0.2

@@ -13,12 +13,14 @@ library:
   exposed-modules:
   - Network.Algolia.Search
   dependencies:
+  - aeson
+  - aeson-iproute
   - base >=4.7 && <5
   - bytestring
-  - aeson
   - http-client
   - http-client-tls
   - http-types
+  - iproute
   - time
   - text
   - scientific
