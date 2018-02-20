@@ -1120,3 +1120,4 @@ waitTask ix taskId =
       case taskStatusResultStatus status of
         NotPublished -> True
         Published -> False
+

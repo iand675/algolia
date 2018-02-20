@@ -8,6 +8,20 @@ license: BSD3
 github: iand675/algolia
 extra-source-files:
 - README.md
+
+default-extensions:
+- OverloadedStrings
+- QuasiQuotes
+- TypeFamilies
+- FlexibleContexts
+- RankNTypes
+- RecordWildCards
+- GeneralizedNewtypeDeriving
+- QuasiQuotes
+- MultiParamTypeClasses
+- ScopedTypeVariables
+- DefaultSignatures
+
 library:
   source-dirs: src
   exposed-modules:
