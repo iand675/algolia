@@ -5,6 +5,7 @@ author: Ian Duncan
 maintainer: ian@iankduncan.com
 copyright: Ian Duncan
 license: BSD3
+synopsis: A client implementing the Algolia search API
 github: iand675/algolia
 extra-source-files:
 - README.md
