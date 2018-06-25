@@ -1,8 +1,8 @@
--- This file has been generated from package.yaml by hpack version 0.20.0.
+-- This file has been generated from package.yaml by hpack version 0.28.2.
 --
 -- see: https://github.com/sol/hpack
 --
--- hash: 559bcb0205e138d01b5484afd90ea9e442d89d90bec2e038635eac063537098b
+-- hash: e80b214ea8c9bdd78f4cbe26a5b2d1ad3a6bd98273cb74c168f9dd8194dd8e4b
 
 name:                algolia
 version:             0.1.0.0
@@ -16,7 +16,6 @@ copyright:           Ian Duncan
 category:            Web
 build-type:          Simple
 cabal-version:       >= 1.10
-
 extra-source-files:
     README.md
 

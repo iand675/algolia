@@ -7,6 +7,23 @@
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE DefaultSignatures #-}
+
+{- |
+Algolia is not based on traditional search solutions like Lucene or Solr. Algolia was built from the ground up specifically for searching through semi-structured data to power user-facing search.
+
+Speed
+In order to provide the best user experience, we focus on performance - milliseconds matter, and we developed an engine capable of delivering results in a few milliseconds, fast enough to power a seamless, “as-you-type” experience - the de facto consumer-grade search experience.
+
+Our ability to achieve unparalleled speed relies on a multitude of factors, many of which are outlined in this blog post. For instance, the Algolia engine handles the vast majority of computation at indexing time, as opposed to at query time. Beyond this, we control the full stack end-to-end. We’ve obsessed over every detail, from obtaining high quality infrastructure (bare-metal servers!) to crafting our own Ubuntu-based OS painstakingly modified for search engine performance.
+
+Beyond speed, we focus on providing all the features necessary to build a full-fledged search experience out-of-the-box: prefix search, typo-tolerance, faceting, highlighting, and more.
+
+Relevance
+
+Performance is important; however, in order for search to be successful, results need to be relevant to the user. Varying from the traditional TF-IDF approach to relevancy, we built a modern tie-breaking algorithm tuned specifically for semi-structured data. Rather than calculating one “score” per result and sorting based solely off a magic number, Algolia calculates N scores and then applies N successive sorting. In layman’s terms, this means “buckets” of results are sorted by a cascade of varying criteria. When matches occur in the first criterion, the second criterion is considered to help break the tie, and so on in succession. This approach is meant to mimic how our brains naturally search for information - and as a consequence, is far easier to debug.
+
+The Algolia engine provides various criteria for building stellar textual relevancy. On top of these, additional rules can be set to further hone the relevancy for a specific dataset. For example, a numeric “popularity” attribute could be leveraged as a potential tie-breaker rule to help more popular items rank higher. By enabling business relevance metrics to be added at will and via API, this forms the foundation for handling advanced search experiences like personalization, merchandising and more.
+-}
 module Network.Algolia.Search
   ( mkAlgoliaClient
   , AlgoliaClient
@@ -113,6 +130,7 @@ import Data.Hashable
 import Data.HashMap.Strict (HashMap)
 import qualified Data.HashMap.Strict as H
 import Data.Maybe
+import Data.Proxy
 import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Text.Encoding (encodeUtf8, decodeUtf8)
@@ -123,7 +141,7 @@ import Data.Aeson hiding (Result)
 import Data.Scientific
 import Data.Monoid
 import Data.String
-import Network.HTTP.Client
+import Network.HTTP.Client hiding (Proxy)
 import Network.HTTP.Client.TLS
 import Network.HTTP.Types
 import Network.HTTP.Types.QueryLike
@@ -140,12 +158,15 @@ data AlgoliaClient = AlgoliaClient
   , algoliaClientApplicationId :: ApplicationId
   }
 
+-- | Make an algolia client from the provided API key and application id.
 mkAlgoliaClient :: ApiKey -> ApplicationId -> AlgoliaClient
 mkAlgoliaClient k aid = AlgoliaClient mempty k aid
 
+-- | Given a data type @c@ that implements @Has AlgoliaClient c@, perform an algolia request.
 simpleAlgolia :: (MonadIO m, Has AlgoliaClient c) => c -> ReaderT c m a -> m a
 simpleAlgolia = flip runReaderT
 
+-- | Create an algolia client from @ALGOLIA_APP_ID@ and @ALGOLIA_KEY@ environment variables.
 algoliaFromEnv :: (MonadIO m) => ReaderT AlgoliaClient m a -> m a
 algoliaFromEnv m = do
   k <- liftIO $ getEnv "ALGOLIA_KEY"
@@ -153,9 +174,9 @@ algoliaFromEnv m = do
   simpleAlgolia (mkAlgoliaClient (ApiKey $ pack k) (ApplicationId $ pack i)) m
 
 data AlgoliaError
-  = JsonParseError String
-  | NonConformingResult Request (Response ()) Value String
-  | ToJsonInstanceMustProduceAnObject
+  = JsonParseError String -- ^ The response was a JSON value, but the library does not know how to handle it properly.
+  | NonConformingResult Request (Response ()) Value String -- ^ The response was not JSON.
+  | ToJsonInstanceMustProduceAnObject -- ^ A JSON object was expected as the response, but it was some other JSON type.
   deriving (Show, Typeable)
 
 instance Exception AlgoliaError
@@ -245,6 +266,7 @@ newtype TaskId = TaskId { fromTaskId :: Int }
 instance ToTemplateValue TaskId where
   toTemplateValue = toTemplateValue . fromTaskId
 
+-- | Convert a coercible type f
 class Reconstrain f where
   reconstrain :: f a -> f b
   default reconstrain :: Coercible (f a) (f b) => f a -> f b
@@ -252,6 +274,8 @@ class Reconstrain f where
 
 instance Reconstrain ObjectId
 instance Reconstrain IndexName
+instance Reconstrain Proxy where
+  reconstrain _ = Proxy
 
 data IndexInfo = IndexInfo
   { indexInfoName :: IndexName Object
@@ -904,6 +928,9 @@ instance FromJSON TaskStatusResult where
     <$> r .: "status"
     <*> r .: "pendingTask"
 
+-- | Get the status of a task. This can be used to wait for a task to be processed via polling.
+--
+-- See 'waitTask' for an implementation of this behavior.
 getTaskStatus :: IndexName a -> TaskId -> Result TaskStatusResult
 getTaskStatus ix t = do
   c <- getter <$> ask
@@ -1096,6 +1123,24 @@ getLogs o l ix t = do
       BuildLogs -> "build"
       ErrorLogs -> "error"
 
+{- |
+You may have a single index containing per-user data. In that case, you may wish to restrict access to the records of one particular user. Typically, all your records would be tagged with their associated user_id, and you would add a filter at query time like filters=user_id:${requested_id} to retrieve only what the querying user has access to.
+
+Adding that filter directly from the frontend (browser or mobile application) will result in a security breach, because the user would be able to modify the filters you’ve set, e.g. by modifying the JavaScript code.
+
+In order to keep sending the query from the browser (which is recommended for optimal latency) but only target secured records, you can generate secured API keys from your backend and use them in your frontend code. The backend will then automatically enforce the security filters contained in the key; the user will not be able to alter them.
+
+A secured API key is used like any other API key via the X-Algolia-API-Key request header.
+
+Generate a secured API key
+Secured API keys are generated by hashing (HMAC SHA-256) the following criteria together:
+
+a private API key (can be any API Key that is not the admin API Key), used as the secret for HMAC SHA-256;
+
+a URL-encoded list of query parameters defining the security filters.
+
+The result of the hashing is concatenated to the URL-encoded query parameters, and this content is encoded in Base64 to generate the final secured API key.
+-}
 generateSecuredApiKey :: ApiKey -> Query -> Maybe ByteString -> ByteString
 generateSecuredApiKey privateKey qps' userKey = convertToBase Base64 (hmac <> qps)
   where
@@ -1106,6 +1151,7 @@ generateSecuredApiKey privateKey qps' userKey = convertToBase Base64 (hmac <> qp
       Nothing -> renderQuery False qps'
       Just uk -> renderQuery False (qps' <> [("userToken", Just uk)])
 
+-- | Wait for a task to be processed by Algolia
 waitTask :: IndexName a -> TaskId -> Result ()
 waitTask ix taskId =
   void $
@@ -1120,4 +1166,3 @@ waitTask ix taskId =
       case taskStatusResultStatus status of
         NotPublished -> True
         Published -> False
-
